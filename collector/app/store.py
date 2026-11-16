@@ -13,6 +13,7 @@ import sqlite3
 import threading
 
 from . import config
+from . import qc
 
 _init_lock = threading.Lock()
 
@@ -45,6 +46,7 @@ def init_db():
         try:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(SCHEMA)
+            qc.init_qc_tables(conn)
             conn.commit()
         finally:
             conn.close()
@@ -82,13 +84,23 @@ def published():
 
 
 def clear_replica():
-    """Local reset: drop all replica rows and all durable sync state."""
+    """本地重置：清空副本行与同步状态。
+
+    质控历史（qc_batches / qc_batch_readings / qc_confirmations）不删除：
+    仍在途或已放行的批次在同一事务内整体标记失效并记录原因，保留当时的
+    输入、确认与失效结论。
+    """
     conn = connect()
     try:
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute("DELETE FROM stations")
         conn.execute("DELETE FROM readings")
         conn.execute("DELETE FROM meta")
+        qc.invalidate_all_on_reset(conn)
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 

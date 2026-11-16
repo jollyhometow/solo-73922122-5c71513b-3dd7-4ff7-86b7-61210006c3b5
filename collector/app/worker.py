@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 import psycopg2
 from psycopg2.extras import LogicalReplicationConnection, REPLICATION_LOGICAL
 
-from . import config, store
+from . import config, qc, store
 from .decoder import is_begin, is_commit, parse_change
 
 log = logging.getLogger("collector.worker")
@@ -192,6 +192,12 @@ class ChangeConsumer:
             return
         db = store.connect()
         try:
+            # QC invalidation must take effect together with the two-table
+            # landing of the SAME source transaction: compute affected batches
+            # while the old rows are still in place, then apply the changes,
+            # all inside one SQLite transaction. Readers can never observe
+            # new data with still-valid (stale) batches.
+            qc.invalidate_for_changes(db, changes)
             for change in changes:
                 apply_change(db, change)
             # Persisted in the SAME transaction as the data -> never confirm a
@@ -289,13 +295,21 @@ class Worker:
         self._drop_slot_if_exists()
 
         # Close the replica while rebuilding (contract: not open until complete).
+        # The whole replica content is about to be replaced by a fresh snapshot,
+        # so every QC batch based on the old content must be permanently
+        # invalidated in the SAME transaction (same semantics as a reset).
         db = store.connect()
         try:
+            db.execute("BEGIN IMMEDIATE")
             db.execute("DELETE FROM stations")
             db.execute("DELETE FROM readings")
             store.upsert_meta(db, "snapshot_done", "0")
             store.upsert_meta(db, "last_applied_lsn", "0")
+            qc.invalidate_all_on_reset(db, qc.REASON_SNAPSHOT_REBUILD)
             db.commit()
+        except Exception:
+            db.rollback()
+            raise
         finally:
             db.close()
 

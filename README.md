@@ -3,6 +3,8 @@
 监测数据离线质控：分析侧只读**本地副本**，不直连采集库。
 FastAPI + SQLite 采集网页，从本地 PostgreSQL 同步 `stations(id, correction)` 与
 `readings(id, station_id, value)`（各至多 500 行、非空整数、源端仅行级增改删）。
+另在副本上提供**质控放行页**（`/qc`）：数据员把核查过的站点读数整批冻结、
+逐条确认异常后放行给离线分析。
 
 ## 功能
 
@@ -14,6 +16,10 @@ FastAPI + SQLite 采集网页，从本地 PostgreSQL 同步 `stations(id, correc
 - 全量中断**自动重建**；**未完成不开放副本**（查询返回 409）
 - 源离线时**已发布副本仍可查**并显示断连
 - **仅一个采集进程**，严格保持源事务提交顺序
+- **质控放行**（`/qc`）：选站 + 整数上下限建批，冻结该站当前全部 readings 与
+  stations.correction，按 `value + correction` 判异常；逐条确认全部异常后才能放行；
+  供数只返回有效已放行整批；源端已提交变化使相关批次**永久失效**（含迁站两站、
+  副本重置全部旧批），历史输入/确认/失效原因永久保留
 
 ## 架构
 
@@ -23,9 +29,9 @@ PostgreSQL (wal_level=logical)
   │  ② START_REPLICATION SLOT ... (test_decoding)        持续接收已提交事务
   ▼
 collector（FastAPI 单进程，单个后台同步线程）
-  │  每个源事务 = 一个 SQLite 事务（同事务写入 last_applied_lsn）
+  │  每个源事务 = 一个 SQLite 事务（同事务写入 last_applied_lsn + 质控批次失效标记）
   ▼
-SQLite 副本（WAL）  ⇠  网页 / API 只读查询
+SQLite 副本（WAL）  ⇠  网页 / API 只读查询、质控放行（qc_batches 等三张表）
 ```
 
 ### 正确性要点
@@ -40,6 +46,20 @@ SQLite 副本（WAL）  ⇠  网页 / API 只读查询
 | 进程重启 | `sync_requested` 标记持久化；重启后自动续传：快照未完成则重建，已完成则从持久化 LSN 继续 |
 | 全量中断可重建 | 快照整体一个 SQLite 事务，中断即回滚，副本保持未发布；重启后丢弃旧槽重建 |
 | 单采集进程 | 进程内启动锁 + 源端槽占用检测（槽被占用时拒绝第二个采集者并提示） |
+
+### 质控放行正确性要点
+
+| 要求 | 实现 |
+| --- | --- |
+| 冻结整批 | 建批在单个 SQLite 事务内把该站当前全部 readings 行与 correction 复制到 `qc_batch_readings`，异常按冻结的 `value + correction` 与整数上下限判定；源端之后任何变化都不改变批内内容 |
+| 逐条确认后才放行 | 放行 SQL 以 `NOT EXISTS` 检查确认表，存在未确认异常即 409；重复确认/确认非异常均拒绝；无异常批次可直接放行 |
+| 失效与两表落库同事务 | 源事务落库前在**同一 SQLite 事务**内调用 `qc.invalidate_for_changes`：先回查变更前旧归属再写新值，提交后读者只能同时看到“新数据 + 批次已失效”，不存在数据已变而批次仍有效的窗口 |
+| 审核与更正交错不能放行过期批 | 放行用条件 `UPDATE ... WHERE status='valid'` 兜底；失效后确认与放行一律 409，且失效永久（之后改回原值不恢复） |
+| 失效范围 | 校正变更→该站；读数 value/成员增删→该站；读数迁站（station_id 变化，解码器不发旧非键列，落库前回查旧归属）→**新旧两站**；无关站更正不影响其他站批次 |
+| 供数只给有效整批 | `/api/qc/released` 仅返回 `released` 且未失效批次；状态与明细在同一个读事务（`BEGIN`）内取出，必然对应同一已提交快照 |
+| 副本重置 / 全量重建 | 两表被整体替换时，在同一事务内把全部批次标记失效（重置原因或“全量重建”原因），不删除质控历史：已失效批次追加原因，冻结输入、确认记录、原失效时间全部保留 |
+| 重启保留结论 / 无半份写入 | 批次、确认、失效全部为 SQLite 已提交数据，重启即恢复；所有写操作单事务 `BEGIN IMMEDIATE`，异常即回滚，不留半份审核或放行 |
+| 未发布不能建批 | 建批先检查 `snapshot_done=1`，否则 409 |
 
 ## 运行（Docker Compose）
 
@@ -63,6 +83,14 @@ docker compose up -d --build
 | GET | `/api/stations` | 查询 stations 副本（未发布返回 409） |
 | GET | `/api/readings?station_id=&limit=` | 查询 readings 副本（未发布返回 409） |
 | GET | `/api/replica/dump` | 两表**同一读事务**的一致快照（用于跨表一致性校验） |
+| GET | `/qc` | 质控放行网页（建批 / 逐条确认 / 放行 / 供数目录） |
+| POST | `/api/qc/batches` | 建批：`{station_id, lower_limit, upper_limit}`（均整数；未发布 409） |
+| GET | `/api/qc/batches` | 全部批次概览（含已失效历史） |
+| GET | `/api/qc/batches/{id}` | 批次状态 + 全部冻结明细（同一读事务快照） |
+| POST | `/api/qc/batches/{id}/confirm` | 逐条确认异常：`{reading_id}`（非异常/重复/失效均 409） |
+| POST | `/api/qc/batches/{id}/release` | 放行（仍有未确认异常或已失效 → 409） |
+| GET | `/api/qc/released` | 供数目录：仅有效已放行批次 |
+| GET | `/api/qc/released/{id}` | 供数整批：有效已放行批次完整冻结快照，否则 409 |
 
 ### 配置（环境变量）
 
@@ -97,7 +125,9 @@ python3 demo/demo.py        # 仅需 Python 标准库 + docker
 ## 测试
 
 ```bash
-cd collector && python3 -m unittest discover -s tests   # 解码器/应用逻辑单元测试
+cd collector && python3 -m unittest discover -s tests
+# test_decoder/test_consumer：解码器与源事务应用；test_qc：质控失效/确认/放行/重置；
+# test_api：质控 HTTP 层（409 语义与完整放行供数流程）
 ```
 
 ## 限制（按数据契约）

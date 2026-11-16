@@ -13,7 +13,9 @@
   3. docker compose stop db：状态显示断连、已发布副本仍可查询；
      重新启动 db 后自动续传，新写入继续同步；
   4. docker compose restart collector：从持久化位置接续，无漏收、无重复生效；
-  5. 全量进行中重启 collector：未完成不开放副本，自动重建后最终一致。
+  5. 全量进行中重启 collector：未完成不开放副本，自动重建后最终一致；
+  6. 质控放行：建批冻结 → 逐条确认异常 → 放行供数；校正变更/迁站使相关批次
+     同事务永久失效（改回不恢复、失效批不再供数）；副本重置旧批全失效但历史保留。
 
 仅使用 Python 标准库；通过 `docker compose exec db psql` 操作源库。
 """
@@ -31,6 +33,25 @@ FAILS = []
 # ----------------------------------------------------------------- helpers
 def api(path, method="GET"):
     req = urllib.request.Request(API + path, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read() or b"{}")
+        except Exception:
+            body = {}
+        return e.code, body
+    except Exception:
+        return 0, {}
+
+
+def api_json(path, method, payload):
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        API + path, data=data, method=method,
+        headers={"Content-Type": "application/json"},
+    )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.status, json.loads(resp.read() or b"{}")
@@ -215,6 +236,77 @@ def main():
     check("自动重建并进入流式",
           wait_for("恢复 streaming", lambda: phase() == "streaming", 240))
     check("重建后副本与源一致", wait_for("最终一致", compare_full, 90))
+
+    print("== 6. 质控放行：冻结 → 逐条确认 → 放行 → 供数 → 失效 → 重置 ==")
+    wait_for("副本已发布", lambda: status().get("published") is True, 30)
+    # 选一个确定会有异常的站点：把 1 号站上下限设得很窄
+    code, b = api_json("/api/qc/batches", "POST",
+                       {"station_id": 1, "lower_limit": 0, "upper_limit": 10})
+    check("建批成功（HTTP 201）", code == 201, f"(got {code})")
+    bid = b.get("id")
+    check("批内冻结读数非空", b.get("reading_count", 0) > 0)
+    check("异常已按 value+correction 判定", b.get("anomaly_count", 0) >= 0)
+    # 未确认完不能放行
+    code, _ = api(f"/api/qc/batches/{bid}/release", "POST")
+    check("异常未确认完不能放行 (409)", code == 409, f"(got {code})")
+    # 逐条确认全部异常
+    anomalies = [r["reading_id"] for r in b["readings"] if r["is_anomaly"]]
+    for rid in anomalies:
+        code, _ = api_json(f"/api/qc/batches/{bid}/confirm", "POST",
+                           {"reading_id": rid})
+        check(f"确认异常 reading {rid}", code == 200, f"(got {code})")
+    if anomalies:
+        code, _ = api_json(f"/api/qc/batches/{bid}/confirm", "POST",
+                           {"reading_id": anomalies[0]})
+        check("重复确认被拒 (409)", code == 409, f"(got {code})")
+    code, rel = api(f"/api/qc/batches/{bid}/release", "POST")
+    check("全部确认后放行成功", code == 200 and rel.get("status") == "released",
+          f"(got {code})")
+    code, served = api(f"/api/qc/released/{bid}")
+    check("供数只返回有效已放行整批", code == 200 and
+          len(served.get("readings", [])) == rel.get("reading_count"))
+    check("供数目录包含该批",
+          any(x["id"] == bid for x in api("/api/qc/released")[1].get("rows", [])))
+
+    # 源端已提交校正变更 → 批次与两表落库同事务失效，供数立即关闭
+    psql("UPDATE stations SET correction = correction + 1 WHERE id = 1;")
+    check("校正变更后批次永久失效",
+          wait_for("批次 invalidated",
+                   lambda: api(f"/api/qc/batches/{bid}")[1].get("status")
+                   == "invalidated", 30))
+    code, _ = api(f"/api/qc/released/{bid}")
+    check("失效批次不再供数 (409)", code == 409, f"(got {code})")
+    # 改回去也不恢复
+    psql("UPDATE stations SET correction = correction - 1 WHERE id = 1;")
+    time.sleep(2)
+    check("改回原值不恢复失效结论",
+          api(f"/api/qc/batches/{bid}")[1].get("status") == "invalidated")
+
+    # 迁站影响两站：取站点 2 的一条读数迁到站点 3
+    rid2 = int(psql("SELECT id FROM readings WHERE station_id = 2 LIMIT 1"))
+    b2 = api_json("/api/qc/batches", "POST",
+                  {"station_id": 2, "lower_limit": -100000, "upper_limit": 100000})[1]
+    b3 = api_json("/api/qc/batches", "POST",
+                  {"station_id": 3, "lower_limit": -100000, "upper_limit": 100000})[1]
+    psql(f"UPDATE readings SET station_id = 3 WHERE id = {rid2};")
+    check("迁站使旧站批次失效",
+          wait_for("b2 invalidated",
+                   lambda: api(f"/api/qc/batches/{b2['id']}")[1].get("status")
+                   == "invalidated", 30))
+    check("迁站使新站批次失效",
+          api(f"/api/qc/batches/{b3['id']}")[1].get("status") == "invalidated")
+
+    # 副本重置：全部旧批失效但历史保留，未发布不能建批
+    n_before = len(api("/api/qc/batches")[1].get("rows", []))
+    api("/api/sync/reset", "POST")
+    rows = api("/api/qc/batches")[1].get("rows", [])
+    check("重置后历史批次仍保留", len(rows) == n_before and n_before > 0)
+    check("重置后全部批次失效", all(r["status"] == "invalidated" for r in rows))
+    check("重置原因已记录",
+          all("副本重置" in (r["invalid_reason"] or "") for r in rows))
+    code, _ = api_json("/api/qc/batches", "POST",
+                       {"station_id": 1, "lower_limit": 0, "upper_limit": 10})
+    check("副本未发布时不能建批 (409)", code == 409, f"(got {code})")
 
     print()
     if FAILS:
